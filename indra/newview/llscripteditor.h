@@ -45,6 +45,9 @@ public:
 	
 	// LLView override
 	virtual void	draw();
+
+    // LLTextBase override
+	virtual void	startOfLine();
 	
 	void	initKeywords();
 	void	loadKeywords();
