@@ -136,6 +136,9 @@ LLImageDecodeThread::~LLImageDecodeThread()
 S32 LLImageDecodeThread::update(F32 max_time_ms)
 {
 	FSZoneC(tracy::Color::Blue); // <FS:Beq/> instrument image decodes
+
+    LL_PROFILE_ZONE_SCOPED_CATEGORY_TEXTURE;
+
 	LLMutexLock lock(mCreationMutex);
 	// <FS:Beq> instrument image decodes
 	{
@@ -179,6 +182,9 @@ LLImageDecodeThread::handle_t LLImageDecodeThread::decodeImage(LLImageFormatted*
 	// LLMutexLock lock(mCreationMutex);
 	// handle_t handle = generateHandle();
 	// mCreationList.push_back(creation_info(handle, image, priority, discard, needs_aux, responder));
+
+    LL_PROFILE_ZONE_SCOPED_CATEGORY_TEXTURE;
+	LLMutexLock lock(mCreationMutex);
 	handle_t handle = generateHandle();
 	// If we have a thread pool dispatch this directly.
 	// Note: addRequest could cause the handling to take place on the fetch thread, this is unlikely to be an issue. 
@@ -268,6 +274,7 @@ bool LLImageDecodeThread::ImageRequest::processRequest()
 
 bool LLImageDecodeThread::ImageRequest::processRequestIntern()
 {
+    LL_PROFILE_ZONE_SCOPED_CATEGORY_TEXTURE;
 	// <FS:Beq> allow longer timeout for async and add instrumentation
 	// const F32 decode_time_slice = .1f;
 	FSZoneC(tracy::Color::DarkOrange); 
@@ -350,6 +357,7 @@ bool LLImageDecodeThread::ImageRequest::processRequestIntern()
 
 void LLImageDecodeThread::ImageRequest::finishRequest(bool completed)
 {
+    LL_PROFILE_ZONE_SCOPED_CATEGORY_TEXTURE;
 	if (mResponder.notNull())
 	{
 		bool success = completed && mDecodedRaw && (!mNeedsAux || mDecodedAux);

@@ -151,7 +151,6 @@ private:
 //	LLPointer<LLControlVariable> mCameraOffsetInitial;
 // [RLVa:KB] - @setcam_eyeoffset
 	// Renamed to catch their uses
-	LLPointer<LLControlVariable> mCameraOffsetInitialControl;
 	LLPointer<LLControlVariable> mRlvCameraOffsetInitialControl;
 // [/RLVa:KB]
 
@@ -163,7 +162,6 @@ private:
 //	LLPointer<LLControlVariable> mFocusOffsetInitial;
 // [RLVa:KB] - @setcam_focusoffset
 	// Renamed to catch their uses
-	LLPointer<LLControlVariable> mFocusOffsetInitialControl;
 	LLPointer<LLControlVariable> mRlvFocusOffsetInitialControl;
 // [/RLVa:KB]
 

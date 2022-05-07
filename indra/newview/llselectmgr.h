@@ -477,9 +477,6 @@ private:
 
 class LLSelectMgr : public LLEditMenuHandler, public LLSingleton<LLSelectMgr>, public nd::selection::PropertiesServer
 {
-	LLSINGLETON(LLSelectMgr);
-	~LLSelectMgr();
-
 public:
 	static BOOL					sRectSelectInclusive;	// do we need to surround an object to pick it?
 	static BOOL					sRenderHiddenSelections;	// do we show selection silhouettes that are occluded?
@@ -505,6 +502,9 @@ public:
 	LLCachedControl<bool>					mDebugSelectMgr;
 
 public:
+    LLSelectMgr();
+    ~LLSelectMgr();
+
 	static void cleanupGlobals();
 
 	// LLEditMenuHandler interface

@@ -91,7 +91,6 @@
 #include "llsdutil_math.h"
 #include "lllocationhistory.h"
 #include "llfasttimerview.h"
-#include "lltelemetry.h"
 #include "llvector4a.h"
 #include "llviewermenufile.h"
 #include "llvoicechannel.h"
@@ -249,11 +248,12 @@
 #include "llavatariconctrl.h"
 #include "llgroupiconctrl.h"
 #include "llviewerassetstats.h"
+#include "workqueue.h"
+using namespace LL;
 
 // Include for security api initialization
 #include "llsecapi.h"
 #include "llmachineid.h"
-#include "llmainlooprepeater.h"
 #include "llcleanup.h"
 
 #include "llcoproceduremanager.h"
@@ -396,6 +396,10 @@ BOOL gLogoutInProgress = FALSE;
 
 BOOL gSimulateMemLeak = FALSE;
 
+// We don't want anyone, especially threads working on the graphics pipeline,
+// to have to block due to this WorkQueue being full.
+WorkQueue gMainloopWork("mainloop", 1024*1024);
+
 ////////////////////////////////////////////////////////////
 // Internal globals... that should be removed.
 
@@ -437,42 +441,6 @@ static std::string gLaunchFileOnQuit;
 // Used on Win32 for other apps to identify our window (eg, win_setup)
 // Note: Changing this breaks compatibility with SLURL handling, try to avoid it.
 const char* const VIEWER_WINDOW_CLASSNAME = "Second Life";
-
-//-- LLDeferredTaskList ------------------------------------------------------
-
-/**
- * A list of deferred tasks.
- *
- * We sometimes need to defer execution of some code until the viewer gets idle,
- * e.g. removing an inventory item from within notifyObservers() may not work out.
- *
- * Tasks added to this list will be executed in the next LLAppViewer::idle() iteration.
- * All tasks are executed only once.
- */
-class LLDeferredTaskList: public LLSingleton<LLDeferredTaskList>
-{
-	LLSINGLETON_EMPTY_CTOR(LLDeferredTaskList);
-	LOG_CLASS(LLDeferredTaskList);
-
-	friend class LLAppViewer;
-	typedef boost::signals2::signal<void()> signal_t;
-
-	void addTask(const signal_t::slot_type& cb)
-	{
-		mSignal.connect(cb);
-	}
-
-	void run()
-	{
-		if (!mSignal.empty())
-		{
-			mSignal();
-			mSignal.disconnect_all_slots();
-		}
-	}
-
-	signal_t mSignal;
-};
 
 //----------------------------------------------------------------------------
 
@@ -639,7 +607,7 @@ static void settings_to_globals()
 
 	LLSurface::setTextureSize(gSavedSettings.getU32("RegionTextureSize"));
 
-	LLRender::sGLCoreProfile = gSavedSettings.getBOOL("RenderGLCoreProfile");
+	LLRender::sGLCoreProfile = gSavedSettings.getBOOL("RenderGLContextCoreProfile");
 	LLRender::sNsightDebugSupport = gSavedSettings.getBOOL("RenderNsightDebugSupport");
 	// <FS:Ansariel> Vertex Array Objects are required in OpenGL core profile
 	//LLVertexBuffer::sUseVAO = gSavedSettings.getBOOL("RenderUseVAO");
@@ -676,17 +644,16 @@ static void settings_to_globals()
 
 static void settings_modify()
 {
-	LLPipeline::sRenderTransparentWater	= gSavedSettings.getBOOL("RenderTransparentWater");
-	LLPipeline::sRenderBump				= gSavedSettings.getBOOL("RenderObjectBump");
-	LLPipeline::sRenderDeferred = LLPipeline::sRenderTransparentWater && LLPipeline::sRenderBump && gSavedSettings.getBOOL("RenderDeferred");
-//    LLRenderTarget::sUseFBO = LLPipeline::sRenderDeferred && gSavedSettings.getBOOL("RenderAvatarVP");
+    LLPipeline::sRenderTransparentWater = gSavedSettings.getBOOL("RenderTransparentWater");
+    LLPipeline::sRenderBump             = gSavedSettings.getBOOL("RenderObjectBump");
+    LLPipeline::sRenderDeferred         = LLPipeline::sRenderBump && gSavedSettings.getBOOL("RenderDeferred");
 // [RLVa:KB] - @setsphere
-	LLRenderTarget::sUseFBO				= (LLPipeline::sRenderDeferred && gSavedSettings.getBOOL("RenderAvatarVP")) || (gSavedSettings.getBOOL("WindLightUseAtmosShaders") && LLPipeline::sUseDepthTexture);
+    LLRenderTarget::sUseFBO             = (LLPipeline::sRenderDeferred || (gSavedSettings.getBOOL("WindLightUseAtmosShaders") && LLPipeline::sUseDepthTexture));
 // [/RLVa:KB]
-	LLVOSurfacePatch::sLODFactor		= gSavedSettings.getF32("RenderTerrainLODFactor");
-	LLVOSurfacePatch::sLODFactor *= LLVOSurfacePatch::sLODFactor; //square lod factor to get exponential range of [1,4]
-	gDebugGL = gSavedSettings.getBOOL("RenderDebugGL") || gDebugSession;
-	gDebugPipeline = gSavedSettings.getBOOL("RenderDebugPipeline");
+    LLVOSurfacePatch::sLODFactor        = gSavedSettings.getF32("RenderTerrainLODFactor");
+    LLVOSurfacePatch::sLODFactor *= LLVOSurfacePatch::sLODFactor;  // square lod factor to get exponential range of [1,4]
+    gDebugGL       = gSavedSettings.getBOOL("RenderDebugGL") || gDebugSession;
+    gDebugPipeline = gSavedSettings.getBOOL("RenderDebugPipeline");
 }
 
 class LLFastTimerLogThread : public LLThread
@@ -750,6 +717,7 @@ LLAppViewer::LLAppViewer()
 	mLogoutMarkerFile(),
 	mReportedCrash(false),
 	mNumSessions(0),
+    mGeneralThreadPool(nullptr),
 	mPurgeCache(false),
 	mPurgeCacheOnExit(false),
 	mPurgeUserDataOnExit(false),
@@ -768,7 +736,6 @@ LLAppViewer::LLAppViewer()
 	mFastTimerLogThread(NULL),
 	mSettingsLocationList(NULL),
 	mIsFirstRun(false),
-	//mMinMicroSecPerFrame(0.f),	// <FS:Ansariel> FIRE-22297: FPS limiter not working properly on Mac/Linux
 	mSaveSettingsOnExit(true),		// <FS:Zi> Backup Settings
 	mPurgeTextures(false) // <FS:Ansariel> FIRE-13066
 {
@@ -1047,8 +1014,6 @@ bool LLAppViewer::init()
 	LLNotifications::instance();
 	LL_INFOS("InitInfo") << "Notifications initialized." << LL_ENDL ;
 
-    writeSystemInfo();
-
 	//////////////////////////////////////////////////////////////////////////////
 	//////////////////////////////////////////////////////////////////////////////
 	//////////////////////////////////////////////////////////////////////////////
@@ -1164,8 +1129,8 @@ bool LLAppViewer::init()
 	}
 	LL_INFOS("InitInfo") << "Cache initialization is done." << LL_ENDL ;
 
-	// Initialize the repeater service.
-	LLMainLoopRepeater::instance().start();
+    // Initialize event recorder
+    LLViewerEventRecorder::createInstance();
 
 	//
 	// Initialize the window
@@ -1173,6 +1138,9 @@ bool LLAppViewer::init()
 	gGLActive = TRUE;
 	initWindow();
 	LL_INFOS("InitInfo") << "Window is initialized." << LL_ENDL ;
+
+    // writeSystemInfo can be called after window is initialized (gViewerWindow non-null)
+    writeSystemInfo();
 
 	// initWindow also initializes the Feature List, so now we can initialize this global.
 	LLCubeMap::sUseCubeMaps = LLFeatureManager::getInstance()->isFeatureAvailable("RenderCubeMap");
@@ -1197,19 +1165,6 @@ bool LLAppViewer::init()
 			OSMB_OK);
 		return 0;
 	}
-
-    // If we don't have the right shader requirements.
-    if (!gGLManager.mHasShaderObjects
-        || !gGLManager.mHasVertexShader
-        || !gGLManager.mHasFragmentShader)
-    {
-        LLUIString details = LLNotifications::instance().getGlobalString("UnsupportedShaderRequirements");
-        OSMessageBox(
-            details.getString(),
-            LLStringUtil::null,
-            OSMB_OK);
-        return 0;
-    }
 
 	// Without SSE2 support we will crash almost immediately, warn here.
 	if (!gSysCPU.hasSSE2())
@@ -1336,7 +1291,7 @@ bool LLAppViewer::init()
 		{
 			url = LLTrans::getString("NvidiaDriverPage");
 		}
-		else if (gGLManager.mIsATI)
+		else if (gGLManager.mIsAMD)
 		{
 			url = LLTrans::getString("AMDDriverPage");
 		}
@@ -1532,14 +1487,15 @@ bool LLAppViewer::init()
 	joystick = LLViewerJoystick::getInstance();
 	joystick->setNeedsReset(true);
 	/*----------------------------------------------------------------------*/
-
-	// <FS:Ansariel> FIRE-22297: FPS limiter not working properly on Mac/Linux
-	//gSavedSettings.getControl("FramePerSecondLimit")->getSignal()->connect(boost::bind(&LLAppViewer::onChangeFrameLimit, this, _2));
-	//onChangeFrameLimit(gSavedSettings.getLLSD("FramePerSecondLimit"));
-	// </FS:Ansariel>
-
 	// Load User's bindings
 	loadKeyBindings();
+
+    //LLSimpleton creations
+    LLEnvironment::createInstance();
+    LLEnvironment::getInstance()->initSingleton();
+    LLWorld::createInstance();
+    LLSelectMgr::createInstance();
+    LLViewerCamera::createInstance();
 
 #if LL_WINDOWS
     if (!mSecondInstance)
@@ -1566,20 +1522,19 @@ void LLAppViewer::initMaxHeapSize()
 	//------------------------------------------------------------------------------------------
 	//currently SL is built under 32-bit setting, we set its max heap size no more than 1.6 GB.
 
-	//F32 max_heap_size_gb = llmin(1.6f, (F32)gSavedSettings.getF32("MaxHeapSize")) ;
-	F32Gigabytes max_heap_size_gb = (F32Gigabytes)gSavedSettings.getF32("MaxHeapSize") ;
-// <FS:Ansariel> Enable low memory checks on 32bit builds
-#if ADDRESS_SIZE == 64
-	max_heap_size_gb = F32Gigabytes(128);
+ #ifndef LL_X86_64
+    F32Gigabytes max_heap_size_gb = (F32Gigabytes)gSavedSettings.getF32("MaxHeapSize") ;
+#else
+    F32Gigabytes max_heap_size_gb = (F32Gigabytes)gSavedSettings.getF32("MaxHeapSize64");
 #endif
-// </FS:Ansariel>
 
-	LLMemory::initMaxHeapSizeGB(max_heap_size_gb);
+    LLMemory::initMaxHeapSizeGB(max_heap_size_gb);
 }
 
 static LLTrace::BlockTimerStatHandle FTM_MESSAGES("System Messages");
 static LLTrace::BlockTimerStatHandle FTM_MESSAGES2("System Messages2");
-static LLTrace::BlockTimerStatHandle FTM_SLEEP("Sleep");
+static LLTrace::BlockTimerStatHandle FTM_SLEEP1("Sleep1");
+static LLTrace::BlockTimerStatHandle FTM_SLEEP2("Sleep2");
 static LLTrace::BlockTimerStatHandle FTM_YIELD("Yield");
 
 static LLTrace::BlockTimerStatHandle FTM_TEXTURE_CACHE("Texture Cache");
@@ -1650,6 +1605,13 @@ bool LLAppViewer::doFrame()
 
 	FSPerfStats::RecordSceneTime T (FSPerfStats::StatType_t::RENDER_FRAME);
 
+	LL_RECORD_BLOCK_TIME(FTM_FRAME);
+
+    if (!LLWorld::instanceExists())
+    {
+        LLWorld::createInstance();
+    }
+
 	LLEventPump& mainloop(LLEventPumps::instance().obtain("mainloop"));
 	LLSD newFrame;
 // <FS:Beq> telemetry enabling. 
@@ -1683,11 +1645,17 @@ bool LLAppViewer::doFrame()
 
 	nd::etw::logFrame(); // <FS:ND> Write the start of each frame. Even if our Provider (Firestorm) would be enabled, this has only light impact. Does nothing on OSX and Linux.
 
-	LL_RECORD_BLOCK_TIME(FTM_FRAME);
 	{FSPerfStats::RecordSceneTime T (FSPerfStats::StatType_t::RENDER_IDLE); // <FS:Beq/> perf stats
-	LLTrace::BlockTimer::processTimes();
-	LLTrace::get_frame_recording().nextPeriod();
-	LLTrace::BlockTimer::logStats();
+	{
+        LL_PROFILE_ZONE_NAMED_CATEGORY_APP("df LLTrace");
+        if (LLFloaterReg::instanceVisible("block_timers"))
+        {
+            LLTrace::BlockTimer::processTimes();
+        }
+        
+        LLTrace::get_frame_recording().nextPeriod();
+        LLTrace::BlockTimer::logStats();
+	}
 
 	LLTrace::get_thread_recorder()->pullFromChildren();
 
@@ -1721,6 +1689,7 @@ bool LLAppViewer::doFrame()
 		}
 		// </FS:Ansariel> MaxFPS Viewer-Chui merge error
 
+		LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df processMiscNativeEvents" )
 		pingMainloopTimeout("Main:MiscNativeWindowEvents");
 
 		if (gViewerWindow)
@@ -1729,7 +1698,10 @@ bool LLAppViewer::doFrame()
 			gViewerWindow->getWindow()->processMiscNativeEvents();
 		}
 
+		{
+			LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df gatherInput" )
 		pingMainloopTimeout("Main:GatherInput");
+		}
 
 		if (gViewerWindow)
 		{
@@ -1753,16 +1725,24 @@ bool LLAppViewer::doFrame()
 			}
 		}
 
+		{
+			LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df mainloop" )
 		// canonical per-frame event
 		mainloop.post(newFrame);
+		}
+
+		{
+			LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df suspend" )
 		// give listeners a chance to run
 		{
 			FSZoneN("Main:Coro");
 		llcoro::suspend();
 		}
 		}// <FS:Beq> ensure we have the entire top scope of frame covered
+
 		if (!LLApp::isExiting())
 		{
+			LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df JoystickKeyboard" )
 			pingMainloopTimeout("Main:JoystickKeyboard");
 
 			// Scan keyboard for movement keys.  Command keys and typing
@@ -1794,13 +1774,20 @@ bool LLAppViewer::doFrame()
 			// Update state based on messages, user input, object idle.
 			{
 				FSPerfStats::RecordSceneTime T (FSPerfStats::StatType_t::RENDER_IDLE);
+				{
+					LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df pauseMainloopTimeout" )
+					pauseMainloopTimeout(); // *TODO: Remove. Messages shouldn't be stalling for 20+ seconds!
+				}
 
-				pauseMainloopTimeout(); // *TODO: Remove. Messages shouldn't be stalling for 20+ seconds!
+				{
+					LL_PROFILE_ZONE_NAMED_CATEGORY_APP("df idle"); //LL_RECORD_BLOCK_TIME(FTM_IDLE);
+					idle();
+				}
 
-				LL_RECORD_BLOCK_TIME(FTM_IDLE);
-				idle();
-
-				resumeMainloopTimeout();
+				{
+					LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df resumeMainloopTimeout" )
+					resumeMainloopTimeout();
+				}
 			}
 
 			if (gDoDisconnect && (LLStartUp::getStartupState() == STATE_STARTED))
@@ -1823,28 +1810,14 @@ bool LLAppViewer::doFrame()
 			if (!LLApp::isExiting() && !gHeadlessClient && gViewerWindow)
 			{
 				FSZoneN("Main:Display");
+				LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df Display" )
 				pingMainloopTimeout("Main:Display");
 				gGLActive = TRUE;
 
 				display();
 
-				// <FS:Ansariel> FIRE-22297: FPS limiter not working properly on Mac/Linux
-				//static U64 last_call = 0;
-				//if (!gTeleportDisplay)
-				//{
-				//	// Frame/draw throttling, controlled by FramePerSecondLimit
-				//	U64 elapsed_time = LLTimer::getTotalTime() - last_call;
-				//	if (elapsed_time < mMinMicroSecPerFrame)
-				//	{
-				//		LL_RECORD_BLOCK_TIME(FTM_SLEEP);
-				//		// llclamp for when time function gets funky
-				//		U64 sleep_time = llclamp(mMinMicroSecPerFrame - elapsed_time, (U64)1, (U64)1e6);
-				//		micro_sleep(sleep_time, 0);
-				//	}
-				//}
-				//last_call = LLTimer::getTotalTime();
-				// </FS:Ansariel>
-
+				{
+					LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df Snapshot" )
 				pingMainloopTimeout("Main:Snapshot");
 				{
 				FSPerfStats::RecordSceneTime T (FSPerfStats::StatType_t::RENDER_IDLE);
@@ -1855,21 +1828,35 @@ bool LLAppViewer::doFrame()
 				gGLActive = FALSE;
 			}
 		}
+		}
 
+		{
+			LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df pauseMainloopTimeout" )
 		pingMainloopTimeout("Main:Sleep");
 
 		pauseMainloopTimeout();
+		}
 
 		// Sleep and run background threads
 		{
-			LL_RECORD_BLOCK_TIME(FTM_SLEEP);
+			//LL_RECORD_BLOCK_TIME(SLEEP2);
+			LL_PROFILE_ZONE_WARN( "Sleep2" )
 
 			// yield some time to the os based on command line option
 			static LLCachedControl<S32> yield_time(gSavedSettings, "YieldTime", -1);
 			if(yield_time >= 0)
 			{
 				LL_RECORD_BLOCK_TIME(FTM_YIELD);
+				LL_PROFILE_ZONE_NUM( yield_time )
 				ms_sleep(yield_time);
+			}
+
+			if (gNonInteractive)
+			{
+				S32 non_interactive_ms_sleep_time = 100;
+				LLAppViewer::getTextureCache()->pause();
+				LLAppViewer::getImageDecodeThread()->pause();
+				ms_sleep(non_interactive_ms_sleep_time);
 			}
 
 			// yield cooperatively when not running as foreground window
@@ -1879,8 +1866,8 @@ bool LLAppViewer::doFrame()
 					|| !gFocusMgr.getAppHasFocus()))
 			{
 				// Sleep if we're not rendering, or the window is minimized.
-				static LLCachedControl<S32> s_bacground_yeild_time(gSavedSettings, "BackgroundYieldTime", 40);
-				S32 milliseconds_to_sleep = llclamp((S32)s_bacground_yeild_time, 0, 1000);
+				static LLCachedControl<S32> s_background_yield_time(gSavedSettings, "BackgroundYieldTime", 40);
+				S32 milliseconds_to_sleep = llclamp((S32)s_background_yield_time, 0, 1000);
 				// don't sleep when BackgroundYieldTime set to 0, since this will still yield to other threads
 				// of equal priority on Windows
 				if (milliseconds_to_sleep > 0)
@@ -1933,22 +1920,29 @@ bool LLAppViewer::doFrame()
 				total_io_pending += io_pending ;
 
 			}
+
+			{
+				LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df gMeshRepo" )
 			gMeshRepo.update() ;
+			}
 
 			if(!total_work_pending) //pause texture fetching threads if nothing to process.
 			{
+				LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df getTextureCache" )
 				LLAppViewer::getTextureCache()->pause();
 				LLAppViewer::getImageDecodeThread()->pause();
 				LLAppViewer::getTextureFetch()->pause();
 			}
 			if(!total_io_pending) //pause file threads if nothing to process.
 			{
+				LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df LLVFSThread" )
 				LLLFSThread::sLocal->pause();
 			}
 
 			//texture fetching debugger
 			if(LLTextureFetchDebugger::isEnabled())
 			{
+				LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df tex_fetch_debugger_instance" )
 				LLFloaterTextureFetchDebugger* tex_fetch_debugger_instance =
 					LLFloaterReg::findTypedInstance<LLFloaterTextureFetchDebugger>("tex_fetch_debugger");
 				if(tex_fetch_debugger_instance)
@@ -1975,8 +1969,10 @@ bool LLAppViewer::doFrame()
 			frameTimer.reset();
 			// </FS:Ansariel>
 
+			{
+				LL_PROFILE_ZONE_NAMED_CATEGORY_APP( "df resumeMainloopTimeout" )
 			resumeMainloopTimeout();
-
+			}
 			pingMainloopTimeout("Main:End");
 		}
 	}
@@ -2002,7 +1998,7 @@ bool LLAppViewer::doFrame()
 		LL_INFOS() << "Exiting main_loop" << LL_ENDL;
 	}
     FSFrameMark; // <FS:Beq> Tracy support delineate Frame
-    LLPROFILE_UPDATE();
+    LL_PROFILER_FRAME_END
 	}
 	FSPerfStats::StatsRecorder::endFrame();
 	return ! LLApp::isRunning();
@@ -2094,6 +2090,7 @@ bool LLAppViewer::cleanup()
     LLPluginProcessParent::shutdown();
 
 	disconnectViewer();
+	LLViewerCamera::deleteSingleton();
 
 	LL_INFOS() << "Viewer disconnected" << LL_ENDL;
 	
@@ -2340,7 +2337,7 @@ bool LLAppViewer::cleanup()
 
     if (LLEnvironment::instanceExists())
     {
-        //Store environment settings if nessesary
+		//Store environment settings if necessary
         LLEnvironment::getInstance()->saveToSettings();
     }
 
@@ -2487,6 +2484,10 @@ bool LLAppViewer::cleanup()
 	sTextureCache->shutdown();
 	sImageDecodeThread->shutdown();
 	sPurgeDiskCacheThread->shutdown();
+    if (mGeneralThreadPool)
+    {
+        mGeneralThreadPool->close();
+    }
 
 	sTextureFetch->shutDownTextureCacheThread() ;
 	sTextureFetch->shutDownImageDecodeThread() ;
@@ -2511,6 +2512,8 @@ bool LLAppViewer::cleanup()
 	mFastTimerLogThread = NULL;
 	delete sPurgeDiskCacheThread;
 	sPurgeDiskCacheThread = NULL;
+    delete mGeneralThreadPool;
+    mGeneralThreadPool = NULL;
 
 	if (LLFastTimerView::sAnalyzePerformance)
 	{
@@ -2569,11 +2572,14 @@ bool LLAppViewer::cleanup()
 	SUBSYSTEM_CLEANUP(LLProxy);
     LLCore::LLHttp::cleanup();
 
-	LLMainLoopRepeater::instance().stop();
-
 	ll_close_fail_log();
 
 	LLError::LLCallStacks::cleanup();
+
+	LLEnvironment::deleteSingleton();
+	LLSelectMgr::deleteSingleton();
+	LLViewerEventRecorder::deleteSingleton();
+    LLWorld::deleteSingleton();
 
 	// It's not at first obvious where, in this long sequence, a generic cleanup
 	// call OUGHT to go. So let's say this: as we migrate cleanup from
@@ -2592,6 +2598,24 @@ bool LLAppViewer::cleanup()
 
 	// return 0;
 	return true;
+}
+
+void LLAppViewer::initGeneralThread()
+{
+    if (mGeneralThreadPool)
+    {
+        return;
+    }
+
+    LLSD poolSizes{ gSavedSettings.getLLSD("ThreadPoolSizes") };
+    LLSD sizeSpec{ poolSizes["General"] };
+    LLSD::Integer poolSize{ sizeSpec.isInteger() ? sizeSpec.asInteger() : 3 };
+    LL_DEBUGS("ThreadPool") << "Instantiating General pool with "
+        << poolSize << " threads" << LL_ENDL;
+    // We don't want anyone, especially the main thread, to have to block
+    // due to this ThreadPool being full.
+    mGeneralThreadPool = new LL::ThreadPool("General", poolSize, 1024 * 1024);
+    mGeneralThreadPool->start();
 }
 
 bool LLAppViewer::initThreads()
@@ -2800,7 +2824,7 @@ bool LLAppViewer::loadSettingsFromDirectory(const std::string& location_key,
 			LL_INFOS("Settings") << "Attempting to load settings for the group " << file.name()
 			    << " - from location " << location_key << LL_ENDL;
 
-			LLControlGroup* settings_group = LLControlGroup::getInstance(file.name);
+			auto settings_group = LLControlGroup::getInstance(file.name);
 			if(!settings_group)
 			{
 				LL_WARNS("Settings") << "No matching settings group for name " << file.name() << LL_ENDL;
@@ -2895,6 +2919,38 @@ namespace
     }
 } // anonymous namespace
 
+// Set a named control temporarily for this session, as when set via the command line --set option.
+// Name can be specified as "<control_group>.<control_name>", with default group being Global.
+bool tempSetControl(const std::string& name, const std::string& value)
+{
+	std::string name_part;
+	std::string group_part;
+	LLControlVariable* control = NULL;
+
+	// Name can be further split into ControlGroup.Name, with the default control group being Global
+	size_t pos = name.find('.');
+	if (pos != std::string::npos)
+	{
+		group_part = name.substr(0, pos);
+		name_part = name.substr(pos+1);
+		LL_INFOS() << "Setting " << group_part << "." << name_part << " to " << value << LL_ENDL;
+		auto g = LLControlGroup::getInstance(group_part);
+		if (g) control = g->getControl(name_part);
+	}
+	else
+	{
+		LL_INFOS() << "Setting Global." << name << " to " << value << LL_ENDL;
+		control = gSavedSettings.getControl(name);
+	}
+
+	if (control)
+	{
+		control->setValue(value, false);
+		return true;
+	}
+	return false;
+}
+
 bool LLAppViewer::initConfiguration()
 {
 	//Load settings files list
@@ -2957,12 +3013,7 @@ bool LLAppViewer::initConfiguration()
 #ifndef	LL_RELEASE_FOR_DOWNLOAD
 	// provide developer build only overrides for these control variables that are not
 	// persisted to settings.xml
-	LLControlVariable* c = gSavedSettings.getControl("ShowConsoleWindow");
-	if (c)
-	{
-		c->setValue(true, false);
-	}
-	c = gSavedSettings.getControl("AllowMultipleViewers");
+	LLControlVariable* c = gSavedSettings.getControl("AllowMultipleViewers");
 	if (c)
 	{
 		c->setValue(true, false);
@@ -3130,9 +3181,10 @@ bool LLAppViewer::initConfiguration()
 		disableCrashlogger();
 	}
 
+	gNonInteractive = gSavedSettings.getBOOL("NonInteractive");
 	// Handle initialization from settings.
 	// Start up the debugging console before handling other options.
-	if (gSavedSettings.getBOOL("ShowConsoleWindow"))
+	if (gSavedSettings.getBOOL("ShowConsoleWindow") && !gNonInteractive)
 	{
 		initConsole();
 	}
@@ -3165,31 +3217,7 @@ bool LLAppViewer::initConfiguration()
             {
                 const std::string& name = *itr;
                 const std::string& value = *(++itr);
-                std::string name_part;
-                std::string group_part;
-				LLControlVariable* control = NULL;
-
-				// Name can be further split into ControlGroup.Name, with the default control group being Global
-				size_t pos = name.find('.');
-				if (pos != std::string::npos)
-				{
-					group_part = name.substr(0, pos);
-					name_part = name.substr(pos+1);
-					LL_INFOS() << "Setting " << group_part << "." << name_part << " to " << value << LL_ENDL;
-					LLControlGroup* g = LLControlGroup::getInstance(group_part);
-					if (g) control = g->getControl(name_part);
-				}
-				else
-				{
-					LL_INFOS() << "Setting Global." << name << " to " << value << LL_ENDL;
-					control = gSavedSettings.getControl(name);
-				}
-
-                if (control)
-                {
-                    control->setValue(value, false);
-                }
-                else
+                if (!tempSetControl(name,value))
                 {
 					LL_WARNS() << "Failed --set " << name << ": setting name unknown." << LL_ENDL;
                 }
@@ -3287,6 +3315,19 @@ bool LLAppViewer::initConfiguration()
 			LLSpellChecker::instance().setSecondaryDictionaries(dict_list);
 		}
 	}
+
+	if (gNonInteractive)
+	{
+		tempSetControl("AllowMultipleViewers", "TRUE");
+		tempSetControl("SLURLPassToOtherInstance", "FALSE");
+		tempSetControl("RenderWater", "FALSE");
+		tempSetControl("FlyingAtExit", "FALSE");
+		tempSetControl("WindowWidth", "1024");
+		tempSetControl("WindowHeight", "200");
+		LLError::setEnabledLogTypesMask(0);
+		llassert_always(!gSavedSettings.getBOOL("SLURLPassToOtherInstance"));
+	}
+
 
 	// Handle slurl use. NOTE: Don't let SL-55321 reappear.
 	// This initial-SLURL logic, up through the call to
@@ -4323,15 +4364,14 @@ void LLAppViewer::writeSystemInfo()
 	gDebugInfo["FirstRunThisInstall"] = gSavedSettings.getBOOL("FirstRunThisInstall");
     gDebugInfo["StartupState"] = LLStartUp::getStartupStateString();
 
-	// <FS:ND> FIRE-31153, do not use gViewerWindow->getWindow which equals nullptr at this point
-	//std::vector<std::string> resolutions = gViewerWindow->getWindow()->getDisplaysResolutionList();
-	std::vector<std::string> resolutions = LLWindow::getDisplaysResolutionList();
-	// </FS:ND>
-
-	for (auto res_iter : resolutions)
-	{
-		gDebugInfo["DisplayInfo"].append(res_iter);
-	}
+    if (gViewerWindow)
+    {
+        std::vector<std::string> resolutions = gViewerWindow->getWindow()->getDisplaysResolutionList();
+        for (auto res_iter : resolutions)
+        {
+            gDebugInfo["DisplayInfo"].append(res_iter);
+        }
+    }
 
 	writeDebugInfo(); // Save out debug_info.log early, in case of crash.
 }
@@ -5118,12 +5158,12 @@ bool LLAppViewer::initCache()
 	{
 		if (mPurgeCache)
 		{
-			LLSplashScreen::update(LLTrans::getString("StartupClearingCache"));
-			purgeCache();
+		LLSplashScreen::update(LLTrans::getString("StartupClearingCache"));
+		purgeCache();
 
 			// clear the new C++ file system based cache
 			LLDiskCache::getInstance()->clearCache();
-		}
+	}
 		else
 		{
 			// purge excessive files from the new file system based cache
@@ -5175,12 +5215,12 @@ bool LLAppViewer::initCache()
 
 	LLVOCache::getInstance()->initCache(LL_PATH_CACHE, gSavedSettings.getU32("CacheNumberOfRegionsForObjects"), getObjectCacheVersion());
 
-    return true;
+		return true;
 }
 
 void LLAppViewer::addOnIdleCallback(const boost::function<void()>& cb)
 {
-	LLDeferredTaskList::instance().addTask(cb);
+	gMainloopWork.post(cb);
 }
 
 void LLAppViewer::loadKeyBindings()
@@ -5466,6 +5506,7 @@ static LLTrace::BlockTimerStatHandle FTM_HUD_EFFECTS("HUD Effects");
 ///////////////////////////////////////////////////////
 void LLAppViewer::idle()
 {
+    LL_PROFILE_ZONE_SCOPED_CATEGORY_APP;
 	pingMainloopTimeout("Main:Idle");
 
 	// Update frame timers
@@ -5483,6 +5524,20 @@ void LLAppViewer::idle()
 	LLFilePickerThread::clearDead();  //calls LLFilePickerThread::notify()
 	LLDirPickerThread::clearDead();
 	F32 dt_raw = idle_timer.getElapsedTimeAndResetF32();
+
+	// Service the WorkQueue we use for replies from worker threads.
+	// Use function statics for the timeslice setting so we only have to fetch
+	// and convert MainWorkTime once.
+	static F32 MainWorkTimeRaw = gSavedSettings.getF32("MainWorkTime");
+	static F32Milliseconds MainWorkTimeMs(MainWorkTimeRaw);
+	// MainWorkTime is specified in fractional milliseconds, but std::chrono
+	// uses integer representations. What if we want less than a microsecond?
+	// Use nanoseconds. We're very sure we will never need to specify a
+	// MainWorkTime that would be larger than we could express in
+	// std::chrono::nanoseconds.
+	static std::chrono::nanoseconds MainWorkTimeNanoSec{
+		std::chrono::nanoseconds::rep(MainWorkTimeMs.value() * 1000000)};
+	gMainloopWork.runFor(MainWorkTimeNanoSec);
 
 	// Cap out-of-control frame times
 	// Too low because in menus, swapping, debugger, etc.
@@ -5549,7 +5604,7 @@ void LLAppViewer::idle()
 
 	if (!gDisconnected)
 	{
-		LL_RECORD_BLOCK_TIME(FTM_NETWORK);
+		LL_PROFILE_ZONE_NAMED_CATEGORY_NETWORK("network"); //LL_RECORD_BLOCK_TIME(FTM_NETWORK);
 		// Update spaceserver timeinfo
 	    LLWorld::getInstance()->setSpaceTimeUSec(LLWorld::getInstance()->getSpaceTimeUSec() + LLUnits::Seconds::fromValue(dt_raw));
 
@@ -5582,7 +5637,7 @@ void LLAppViewer::idle()
 							|| (agent_force_update_time > (1.0f / (F32) AGENT_FORCE_UPDATES_PER_SECOND));
 		if (force_update || (agent_update_time > (1.0f / (F32) AGENT_UPDATES_PER_SECOND)))
 		{
-			LL_RECORD_BLOCK_TIME(FTM_AGENT_UPDATE);
+			LL_PROFILE_ZONE_SCOPED_CATEGORY_NETWORK; //LL_RECORD_BLOCK_TIME(FTM_AGENT_UPDATE);
 			// Send avatar and camera info
 			mLastAgentControlFlags = gAgent.getControlFlags();
 			mLastAgentForceUpdate = force_update ? 0 : agent_force_update_time;
@@ -5831,8 +5886,10 @@ void LLAppViewer::idle()
 	// Here, particles are updated and drawables are moved.
 	//
 
-	LL_RECORD_BLOCK_TIME(FTM_WORLD_UPDATE);
-	gPipeline.updateMove();
+	{
+		LL_PROFILE_ZONE_NAMED_CATEGORY_APP("world update"); //LL_RECORD_BLOCK_TIME(FTM_WORLD_UPDATE);
+		gPipeline.updateMove();
+	}
 
 	LLWorld::getInstance()->updateParticles();
 
@@ -5871,7 +5928,7 @@ void LLAppViewer::idle()
 	LLAvatarRenderInfoAccountant::getInstance()->idle();
 
 	{
-		LL_RECORD_BLOCK_TIME(FTM_AUDIO_UPDATE);
+		LL_PROFILE_ZONE_NAMED_CATEGORY_APP("audio update"); //LL_RECORD_BLOCK_TIME(FTM_AUDIO_UPDATE);
 
 		if (gAudiop)
 		{
@@ -5884,9 +5941,6 @@ void LLAppViewer::idle()
 			gAudiop->idle(max_audio_decode_time);
 		}
 	}
-
-	// Execute deferred tasks.
-	LLDeferredTaskList::instance().run();
 
 	// Handle shutdown process, for example,
 	// wait for floaters to close, send quit message,
@@ -6116,6 +6170,7 @@ static LLTrace::BlockTimerStatHandle FTM_CHECK_REGION_CIRCUIT("Check Region Circ
 
 void LLAppViewer::idleNetwork()
 {
+    LL_PROFILE_ZONE_SCOPED_CATEGORY_NETWORK;
 	pingMainloopTimeout("idleNetwork");
 
 	gObjectList.mNumNewObjects = 0;
@@ -6124,7 +6179,7 @@ void LLAppViewer::idleNetwork()
 	static LLCachedControl<bool> speedTest(gSavedSettings, "SpeedTest");
 	if (!speedTest)
 	{
-		LL_RECORD_BLOCK_TIME(FTM_IDLE_NETWORK); // decode
+		LL_PROFILE_ZONE_NAMED_CATEGORY_NETWORK("idle network"); //LL_RECORD_BLOCK_TIME(FTM_IDLE_NETWORK); // decode
 
 		LLTimer check_message_timer;
 		//  Read all available packets from network
@@ -6318,7 +6373,7 @@ void LLAppViewer::disconnectViewer()
 	// Now we just ask the LLWorld singleton to cleanly shut down.
 	if(LLWorld::instanceExists())
 	{
-		LLWorld::getInstance()->destroyClass();
+		LLWorld::getInstance()->resetClass();
 	}
 	LLVOCache::deleteSingleton();
 
@@ -6332,21 +6387,6 @@ void LLAppViewer::disconnectViewer()
 	// parcel info requests while disconnected.
 	LLUrlEntryParcel::setDisconnected(gDisconnected);
 }
-
-// <FS:Ansariel> FIRE-22297: FPS limiter not working properly on Mac/Linux
-//bool LLAppViewer::onChangeFrameLimit(LLSD const & evt)
-//{
-//	if (evt.asInteger() > 0)
-//	{
-//		mMinMicroSecPerFrame = (U64)(1000000.0f / F32(evt.asInteger()));
-//	}
-//	else
-//	{
-//		mMinMicroSecPerFrame = 0;
-//	}
-//	return false;
-//}
-// </FS:Ansariel>
 
 void LLAppViewer::forceErrorLLError()
 {

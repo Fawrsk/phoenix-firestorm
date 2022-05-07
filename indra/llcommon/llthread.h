@@ -60,7 +60,11 @@ public:
     bool isStopped() const { return (STOPPED == mStatus) || (CRASHED == mStatus); }
     bool isCrashed() const { return (CRASHED == mStatus); } 
     // <FS:Beq> Try to encourage the inlining
-    static LL_FORCE_INLINE id_t currentID(){return std::this_thread::get_id();}; // Return ID of current thread
+    static LL_FORCE_INLINE id_t currentID()
+    {
+        LL_PROFILE_ZONE_SCOPED_CATEGORY_THREAD
+        return std::this_thread::get_id();
+    }; // Return ID of current thread
     static void yield(); // Static because it can be called by the main thread, which doesn't have an LLThread data structure.
     
 public:

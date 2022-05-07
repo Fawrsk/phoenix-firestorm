@@ -5756,7 +5756,7 @@ bool LLVivoxVoiceClient::voiceEnabled(bool no_cache)
 	}
 	static LLCachedControl<bool> sEnableVoiceChat(gSavedSettings, "EnableVoiceChat");
 	static LLCachedControl<bool> sCmdLineDisableVoice(gSavedSettings, "CmdLineDisableVoice");
-	return sEnableVoiceChat && !sCmdLineDisableVoice;
+	return sEnableVoiceChat && !sCmdLineDisableVoice && !gNonInteractive;
 	// </FS:Ansariel>
 }
 // </FS:Ansariel>
